@@ -8,11 +8,11 @@ export const config = {
 const redis = Redis.fromEnv();
 
 const DURATION = 12 * 60 * 60; // 12 hours
-const COOKIE_AGE = 30 * 24 * 60 * 60; // 30 days
 
 const LINK1 = process.env.LINK_1;
 const LINK2 = process.env.LINK_2;
 
+// Validate redirect URLs
 function validUrl(value) {
   try {
     const url = new URL(value);
@@ -22,13 +22,40 @@ function validUrl(value) {
   }
 }
 
+// Get visitor IP from Vercel request headers
+function getVisitorIP(req) {
+  const forwarded = req.headers.get('x-forwarded-for');
+
+  if (forwarded) {
+    return forwarded.split(',')[0].trim();
+  }
+
+  const realIP = req.headers.get('x-real-ip');
+
+  if (realIP) {
+    return realIP.trim();
+  }
+
+  return null;
+}
+
+// Hash IP address using SHA-256
+async function hashIP(ip) {
+  const data = new TextEncoder().encode(ip);
+  const hash = await crypto.subtle.digest('SHA-256', data);
+
+  return Array.from(new Uint8Array(hash))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
 export default async function handler(req) {
 
   // Allow GET and HEAD only
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     return new Response('Method Not Allowed', {
       status: 405,
-      headers: { 'Allow': 'GET, HEAD' },
+      headers: { Allow: 'GET, HEAD' },
     });
   }
 
@@ -39,23 +66,13 @@ export default async function handler(req) {
     });
   }
 
-  // Read visitor cookie
-  const cookies = req.headers.get('cookie') || '';
+  // Get visitor IP
+  const ip = getVisitorIP(req);
 
-  const match = cookies.match(
-    /(?:^|;\s*)saim_visitor=([a-f0-9-]{36})(?:;|$)/i
-  );
-
-  let visitorId = match ? match[1] : null;
-
-  // Validate UUID
-  const validId = visitorId &&
-    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(visitorId);
-
-  const isNewVisitor = !validId;
-
-  if (isNewVisitor) {
-    visitorId = crypto.randomUUID();
+  if (!ip) {
+    return new Response('Unable to identify visitor IP', {
+      status: 503,
+    });
   }
 
   const headers = new Headers({
@@ -64,37 +81,43 @@ export default async function handler(req) {
     'Expires': '0',
   });
 
-  // Save visitor cookie
-  if (isNewVisitor) {
-    headers.set(
-      'Set-Cookie',
-      `saim_visitor=${visitorId}; Max-Age=${COOKIE_AGE}; Path=/; Secure; HttpOnly; SameSite=Lax`
-    );
-  }
-
   let destination;
 
   try {
-    // Atomic visitor tracking
-    const result = await redis.set(
-      `saim:${visitorId}`,
-      '1',
-      {
-        nx: true,
-        ex: DURATION,
-      }
-    );
+    // Create a private IP hash
+    const ipHash = await hashIP(ip);
 
-    // First visit or 12-hour expiry
-    destination = result === 'OK' ? LINK1 : LINK2;
+    const redisKey = `saim:ip:${ipHash}`;
+
+    if (req.method === 'HEAD') {
+      // HEAD requests do not consume the first visit
+      const existing = await redis.exists(redisKey);
+
+      destination = existing ? LINK2 : LINK1;
+
+    } else {
+      // Atomic IP-based visitor tracking
+      const result = await redis.set(
+        redisKey,
+        '1',
+        {
+          nx: true,
+          ex: DURATION,
+        }
+      );
+
+      // First IP visit = LINK1
+      // Existing IP = LINK2
+      destination = result === 'OK' ? LINK1 : LINK2;
+    }
 
   } catch (error) {
-    // Redis failure fallback
     console.error('Redis Redirect Error:', error);
+
+    // Redis failure fallback
     destination = LINK2;
   }
 
-  // Fast HTTP redirect
   headers.set('Location', destination);
 
   return new Response(null, {
