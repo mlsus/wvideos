@@ -1,0 +1,9 @@
+{
+  "redirects": [
+    {
+      "source": "/",
+      "destination": "https://wvideos-redirect.pstube002.workers.dev",
+      "permanent": false
+    }
+  ]
+}
